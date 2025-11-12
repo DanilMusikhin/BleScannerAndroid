@@ -8,21 +8,34 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.enableEdgeToEdge
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.core.view.ViewCompat
-import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.setMargins
 import androidx.core.view.setPadding
+import kotlin.math.pow
+import kotlin.math.round
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken
+import org.eclipse.paho.client.mqttv3.MqttCallback
+import org.eclipse.paho.client.mqttv3.MqttClient
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions
+import org.eclipse.paho.client.mqttv3.MqttMessage
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.NetworkInterface
+import java.util.Collections
+import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
     // Взаимодействие с bluetooth
@@ -43,6 +56,12 @@ class MainActivity : AppCompatActivity() {
     private val UPDATE_THROTTLE_MS = 1000L // Обновляем UI не чаще, чем в 300мс
     private val updateRunnable = Runnable { updateDeviceList() }
 
+    // MQTT
+    private lateinit var mqttClient: MqttClient
+    private val mqttBroker = "tcp://192.168.1.195:1883"
+    private val mqttTopic = "ble-topic-data/device"
+    private var scannerDeviceId: String = ""
+
     // Константы
     companion object {
         private const val REQUEST_PERMISSIONS = 1
@@ -56,7 +75,6 @@ class MainActivity : AppCompatActivity() {
             "48:E7:29:A2:7C:A1"  // ESP32 в режиме метки
         )
     }
-    
 
     // Объект обратного вызова для получения BLE меток: при нахождении результат добавляет в devicesMap
     private val scanCallback = object : ScanCallback() {
@@ -67,9 +85,9 @@ class MainActivity : AppCompatActivity() {
             val device = result.device
             val address = device.address
 
-            // if (address !in WHITELIST_ADDRESSES) {
-            //     return  // Пропускаем устройство, если его нет в белом списке
-            // }
+            if (address !in WHITELIST_ADDRESSES) {
+                return  // Пропускаем устройство, если его нет в белом списке
+            }
 
             // Обновляем или добавляем устройство
             devicesMap[address] = result
@@ -100,9 +118,9 @@ class MainActivity : AppCompatActivity() {
         devicesContainer = findViewById(R.id.devicesContainer)
         scanButton = findViewById(R.id.scanButton)
 
-        // Инициализацию Bluetooth
-        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager;
-        bluetoothAdapter = bluetoothManager.adapter;
+        // Инициализация Bluetooth
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        bluetoothAdapter = bluetoothManager.adapter
 
         // Проверяем есть ли bluetooth на устройстве
         if (bluetoothAdapter == null) {
@@ -116,8 +134,14 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Включите Bluetooth", Toast.LENGTH_LONG).show()
         }
 
-        // Подлючаем сканер BLE меток
-        bluetoothLeScanner = bluetoothAdapter.bluetoothLeScanner;
+        // Подключаем сканер BLE меток
+        bluetoothLeScanner = bluetoothAdapter.bluetoothLeScanner
+
+        // Получаем device_id для сканера в формате MAC-адреса
+        scannerDeviceId = getDeviceMacAddress()
+
+        // Инициализация MQTT клиента
+        initializeMqtt()
 
         scanButton.setOnClickListener {
             if (checkPermission()) {
@@ -131,19 +155,217 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+
+    private fun initializeMqtt() {
+        try {
+            val clientId = "BLE_SCANNER_" + System.currentTimeMillis()
+            mqttClient = MqttClient(mqttBroker, clientId, MemoryPersistence())
+
+            val options = MqttConnectOptions()
+            options.isCleanSession = true
+            options.connectionTimeout = 10
+            options.keepAliveInterval = 60
+
+            // Используем правильный MqttCallback интерфейс
+            mqttClient.setCallback(object : MqttCallback {
+                override fun connectionLost(cause: Throwable) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "MQTT соединение потеряно", Toast.LENGTH_SHORT).show()
+                    }
+                }
+
+                override fun messageArrived(topic: String, message: MqttMessage) {
+                    // Не используется в данном контексте
+                }
+
+                override fun deliveryComplete(token: IMqttDeliveryToken) {
+                    // Сообщение доставлено
+                }
+            })
+
+            mqttClient.connect(options)
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "MQTT подключен успешно", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            runOnUiThread {
+                Toast.makeText(this, "Ошибка подключения MQTT: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    // Получение MAC-адреса устройства
+    private fun getDeviceMacAddress(): String {
+        return try {
+            // Сначала пробуем получить Bluetooth MAC-адрес
+            if (checkPermission() && bluetoothAdapter.isEnabled) {
+                try {
+                    val bluetoothMac = bluetoothAdapter.address
+                    if (bluetoothMac.isNotEmpty() && bluetoothMac != "02:00:00:00:00:00") {
+                        return formatMacAddress(bluetoothMac)
+                    }
+                } catch (e: SecurityException) {
+                    // Если нет разрешения, продолжаем пробовать другие методы
+                }
+            }
+
+            // Пробуем получить WiFi MAC-адрес
+            try {
+                val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                val wifiInfo = wifiManager.connectionInfo
+                val macAddress = wifiInfo.macAddress
+                if (macAddress.isNotEmpty() && macAddress != "02:00:00:00:00:00") {
+                    return formatMacAddress(macAddress)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            // Пробуем получить MAC-адрес из сетевых интерфейсов
+            try {
+                val all: List<NetworkInterface> = Collections.list(NetworkInterface.getNetworkInterfaces())
+                for (nif in all) {
+                    if (!nif.name.equals("wlan0", ignoreCase = true)) continue
+                    val macBytes = nif.hardwareAddress ?: continue
+                    val macBuilder = StringBuilder()
+                    for (b in macBytes) {
+                        macBuilder.append(String.format("%02X:", b))
+                    }
+                    if (macBuilder.isNotEmpty()) {
+                        macBuilder.deleteCharAt(macBuilder.length - 1)
+                        return formatMacAddress(macBuilder.toString())
+                    }
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+
+            // Если не удалось получить MAC-адрес, используем Android ID как запасной вариант
+            getDeviceIdFromAndroidId()
+        } catch (e: Exception) {
+            e.printStackTrace()
+            "UNKNOWN-DEVICE"
+        }
+    }
+
+    // Форматирование MAC-адреса в нужный формат (XX-XX-XX-XX-XX-XX)
+    private fun formatMacAddress(macAddress: String): String {
+        // Убираем все разделители и приводим к верхнему регистру
+        val cleanMac = macAddress.replace(":", "").replace("-", "").uppercase()
+
+        // Форматируем в формат XX-XX-XX-XX-XX-XX
+        return if (cleanMac.length == 12) {
+            "${cleanMac.substring(0, 2)}-${cleanMac.substring(2, 4)}-${cleanMac.substring(4, 6)}-" +
+                    "${cleanMac.substring(6, 8)}-${cleanMac.substring(8, 10)}-${cleanMac.substring(10, 12)}"
+        } else {
+            cleanMac // Возвращаем как есть, если длина не соответствует
+        }
+    }
+
+    // Запасной метод: генерируем ID на основе Android ID
+    private fun getDeviceIdFromAndroidId(): String {
+        return try {
+            val androidId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+            if (androidId != null && androidId.length >= 12) {
+                // Используем часть Android ID для создания MAC-подобного идентификатора
+                val macLike = androidId.take(12).uppercase()
+                formatMacAddress(macLike)
+            } else {
+                // Генерируем случайный MAC-подобный идентификатор
+                val randomMac = (1..12).map {
+                    "0123456789ABCDEF".random()
+                }.joinToString("")
+                formatMacAddress(randomMac)
+            }
+        } catch (e: Exception) {
+            // Фолбэк: случайный MAC
+            val randomMac = (1..12).map {
+                "0123456789ABCDEF".random()
+            }.joinToString("")
+            formatMacAddress(randomMac)
+        }
+    }
+
+    private fun calculateDistance(rssi: Int): Double {
+        return round(10.0.pow((-69.0 - rssi) / (10.0 * 2.0)) * 100.0) / 100.0
+    }
+
+    private fun sendDataToMqtt(devices: List<ScanResult>) {
+        if (!::mqttClient.isInitialized || !mqttClient.isConnected) {
+            return
+        }
+
+        try {
+            val jsonArray = JSONArray()
+
+            devices.forEach { result ->
+                val device = result.device
+                val address = if (checkPermission()) {
+                    try {
+                        // Форматируем MAC-адрес маячка в нужный формат
+                        formatMacAddress(device.address ?: "N/A")
+                    } catch (e: SecurityException) {
+                        "N/A"
+                    }
+                } else {
+                    "N/A"
+                }
+
+                val rssi = result.rssi
+                val distance = calculateDistance(rssi)
+
+                val jsonObject = JSONObject().apply {
+                    put("uuid", UUID.randomUUID().toString())
+                    put("device_id", scannerDeviceId) // Используем MAC-адрес сканера
+                    put("tag_id", address) // MAC-адрес маячка уже отформатирован
+                    put("event_type", "NOTIFY")
+                    put("event_dt", System.currentTimeMillis().toString())
+                    put("rssi", rssi.toString())
+                    put("distance", distance.toString())
+                }
+                jsonArray.put(jsonObject)
+            }
+
+            if (jsonArray.length() > 0) {
+                val message = MqttMessage(jsonArray.toString().toByteArray())
+                message.qos = 1
+                try {
+                    mqttClient.publish(mqttTopic, message)
+                    println("Отправлено в MQTT: ${jsonArray.length()} устройств")
+                    println("Device ID: $scannerDeviceId")
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    runOnUiThread {
+                        Toast.makeText(this, "Ошибка публикации MQTT: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            runOnUiThread {
+                Toast.makeText(this, "Ошибка формирования MQTT сообщения: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     // Проверка необходимых разрешений для работы программы
     private fun checkPermission(): Boolean {
         // С проверкой версии android (android 12 (SDK 31) - BLUETOOTH_SCAN и BLUETOOTH_CONNECT
         // для более старых - разрешения на локацию
-        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.BLUETOOTH_SCAN
             ) == PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.BLUETOOTH_CONNECT
-            ) == PackageManager.PERMISSION_GRANTED
+                    ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.BLUETOOTH_CONNECT
+                    ) == PackageManager.PERMISSION_GRANTED &&
+                    ContextCompat.checkSelfPermission(
+                        this,
+                        Manifest.permission.ACCESS_FINE_LOCATION
+                    ) == PackageManager.PERMISSION_GRANTED
         } else {
             ContextCompat.checkSelfPermission(
                 this,
@@ -154,12 +376,13 @@ class MainActivity : AppCompatActivity() {
 
     // Запрос необходимых разрешений, если они не предоставлены
     private fun requestPermissions() {
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             ActivityCompat.requestPermissions(
                 this,
                 arrayOf(
                     Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_CONNECT
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.ACCESS_FINE_LOCATION
                 ),
                 REQUEST_PERMISSIONS
             )
@@ -192,27 +415,25 @@ class MainActivity : AppCompatActivity() {
         if (!isScanning) {
             devicesMap.clear()
             devicesContainer.removeAllViews()
+            deviceViews.clear()
             isScanning = true
             scanButton.text = "Остановить сканирование"
 
             // Еще одна проверка на нужные разрешения
-            val hasPermissions = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.BLUETOOTH_SCAN
-                ) == PackageManager.PERMISSION_GRANTED
-            } else {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-            }
+            val hasPermissions = checkPermission()
 
             if (!hasPermissions) {
                 return
             }
 
-            bluetoothLeScanner.startScan(scanCallback)
+            try {
+                bluetoothLeScanner.startScan(scanCallback)
+                Toast.makeText(this, "Сканирование начато", Toast.LENGTH_SHORT).show()
+            } catch (e: SecurityException) {
+                Toast.makeText(this, "Ошибка безопасности: ${e.message}", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Ошибка сканирования: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
 
             // Останавливаем сканирование через scanPeriod
             // handler.postDelayed({
@@ -227,23 +448,20 @@ class MainActivity : AppCompatActivity() {
             scanButton.text = "Начать сканирование"
 
             // Еще одна проверка на нужные разрешения
-            val hasPermissions = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.BLUETOOTH_SCAN
-                ) == PackageManager.PERMISSION_GRANTED
-            } else {
-                ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) == PackageManager.PERMISSION_GRANTED
-            }
+            val hasPermissions = checkPermission()
 
             if (!hasPermissions) {
                 return
             }
 
-            bluetoothLeScanner.stopScan(scanCallback)
+            try {
+                bluetoothLeScanner.stopScan(scanCallback)
+                Toast.makeText(this, "Сканирование остановлено", Toast.LENGTH_SHORT).show()
+            } catch (e: SecurityException) {
+                Toast.makeText(this, "Ошибка безопасности: ${e.message}", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Ошибка остановки сканирования: ${e.message}", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -262,9 +480,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            // Отправляем данные на MQTT брокер
+            sendDataToMqtt(devicesMap.values.toList())
+
             devicesMap.values.forEach { result ->
-                var device = result.device
-                
+                val device = result.device
+
                 // Получаем имя из рекламных данных (не требует BLUETOOTH_CONNECT)
                 val name = result.scanRecord?.deviceName
                     ?: if (checkPermission()) {
@@ -278,10 +499,10 @@ class MainActivity : AppCompatActivity() {
                         "Неизвестное устройство"
                     }
 
-                // Получаем адрес с проверкой разрешений
+                // Получаем адрес с проверкой разрешений и форматируем
                 val address = if (checkPermission()) {
                     try {
-                        device.address
+                        formatMacAddress(device.address ?: "N/A")
                     } catch (e: SecurityException) {
                         "N/A"
                     }
@@ -290,7 +511,8 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val rssi = result.rssi
-                val displayText = "$name\nMAC: $address\nRSSI: $rssi дБм\n"
+                val distance = calculateDistance(rssi)
+                val displayText = "$name\nMAC: $address\nRSSI: $rssi дБм\nРасстояние: $distance м"
 
                 // Если view уже существует, просто обновляем текст
                 val existingView = deviceViews[address]
@@ -298,7 +520,7 @@ class MainActivity : AppCompatActivity() {
                     existingView.text = displayText
                 } else {
                     val deviceView = TextView(this).apply {
-                        text = "$name\nMAC: $address\nRSSI: $rssi дБм\n"
+                        text = displayText
                         textSize = 14f
                         setPadding(32, 16, 32, 16)
                         setBackgroundColor(ContextCompat.getColor(this@MainActivity, android.R.color.darker_gray))
@@ -322,5 +544,13 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopScan()
         handler.removeCallbacks(updateRunnable)
+        // Отключаем MQTT клиент
+        if (::mqttClient.isInitialized && mqttClient.isConnected) {
+            try {
+                mqttClient.disconnect()
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
     }
 }
