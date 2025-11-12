@@ -36,26 +36,55 @@ class MainActivity : AppCompatActivity() {
     // UI
     private lateinit var devicesContainer: LinearLayout // Отображение списка устройств
     private lateinit var scanButton: Button // Кнопка сканирования
+    // Оптимизация: кэш view для устройств
+    private val deviceViews = mutableMapOf<String, TextView>()
+    // Оптимизация: тротлинг (снижения производительности устройства) для обновления UI
+    private var lastUpdateTime = 0L
+    private val UPDATE_THROTTLE_MS = 1000L // Обновляем UI не чаще, чем в 300мс
+    private val updateRunnable = Runnable { updateDeviceList() }
 
     // Константы
     companion object {
         private const val REQUEST_PERMISSIONS = 1
+
+        private val WHITELIST_ADDRESSES = setOf(
+            "48:87:2D:9C:DF:04",
+            "48:87:2D:9C:FA:8B",
+            "48:87:2D:9D:58:69",
+            "C6:43:0D:ED:FC:F2",
+            "48:E7:29:A2:7C:A0",
+            "48:E7:29:A2:7C:A1"  // ESP32 в режиме метки
+        )
     }
     
 
     // Объект обратного вызова для получения BLE меток: при нахождении результат добавляет в devicesMap
-    private val scanCallback = object  : ScanCallback() {
+    private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             // Проверяем, что result не null
             result ?: return
 
             val device = result.device
             val address = device.address
-            val rssi = result.rssi
+
+            // if (address !in WHITELIST_ADDRESSES) {
+            //     return  // Пропускаем устройство, если его нет в белом списке
+            // }
 
             // Обновляем или добавляем устройство
             devicesMap[address] = result
-            updateDeviceList()
+
+            // Тротилинг: обновляем UI не чаще чем раз в UPDATE_THROTTLE_MS
+            val currentTime = System.currentTimeMillis()
+            if (currentTime - lastUpdateTime > UPDATE_THROTTLE_MS) {
+                handler.removeCallbacks(updateRunnable)
+                updateDeviceList()
+                lastUpdateTime = currentTime
+            } else {
+                // Откладываем обновление, отменяя предыдущее
+                handler.removeCallbacks(updateRunnable)
+                handler.postDelayed(updateRunnable, UPDATE_THROTTLE_MS)
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -186,9 +215,9 @@ class MainActivity : AppCompatActivity() {
             bluetoothLeScanner.startScan(scanCallback)
 
             // Останавливаем сканирование через scanPeriod
-            handler.postDelayed({
-                stopScan()
-            }, scanPeriod)
+            // handler.postDelayed({
+            //     stopScan()
+            // }, scanPeriod)
         }
     }
 
@@ -221,7 +250,17 @@ class MainActivity : AppCompatActivity() {
     // Добавление UI-представления для Ble метки
     private fun updateDeviceList() {
         runOnUiThread {
-            devicesContainer.removeAllViews()
+            val currentAddress = devicesMap.keys.toSet()
+            val viewAddresses = deviceViews.keys.toSet()
+
+            // Удаляем view для устройств, которых больше нет
+            val addressesToRemove = viewAddresses - currentAddress
+            addressesToRemove.forEach { address ->
+                deviceViews[address]?.let { view ->
+                    devicesContainer.removeView(view)
+                    deviceViews.remove(address)
+                }
+            }
 
             devicesMap.values.forEach { result ->
                 var device = result.device
@@ -251,22 +290,30 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val rssi = result.rssi
+                val displayText = "$name\nMAC: $address\nRSSI: $rssi дБм\n"
 
-                val deviceView = TextView(this).apply {
-                    text = "$name\nMAC: $address\n RSSI: $rssi дБм\n"
-                    textSize = 14f
-                    setPadding(32, 16, 32, 16)
-                    setBackgroundColor(ContextCompat.getColor(this@MainActivity, android.R.color.darker_gray))
+                // Если view уже существует, просто обновляем текст
+                val existingView = deviceViews[address]
+                if (existingView != null) {
+                    existingView.text = displayText
+                } else {
+                    val deviceView = TextView(this).apply {
+                        text = "$name\nMAC: $address\nRSSI: $rssi дБм\n"
+                        textSize = 14f
+                        setPadding(32, 16, 32, 16)
+                        setBackgroundColor(ContextCompat.getColor(this@MainActivity, android.R.color.darker_gray))
+                    }
+
+                    val params = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply {
+                        setMargins(16, 8, 16, 8)
+                    }
+
+                    devicesContainer.addView(deviceView, params)
+                    deviceViews[address] = deviceView
                 }
-
-                val params = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply {
-                    setMargins(16, 8, 16, 8)
-                }
-
-                devicesContainer.addView(deviceView, params)
             }
         }
     }
@@ -274,5 +321,6 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopScan()
+        handler.removeCallbacks(updateRunnable)
     }
 }
