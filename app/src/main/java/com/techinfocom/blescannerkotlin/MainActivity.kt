@@ -42,6 +42,8 @@ class MainActivity : AppCompatActivity() {
     private var lastUpdateTime = 0L
     private val UPDATE_THROTTLE_MS = 1000L // Обновляем UI не чаще, чем в 300мс
     private val updateRunnable = Runnable { updateDeviceList() }
+    // MQTT
+    private lateinit var mqttManager: MqttManager
 
     // Константы
     companion object {
@@ -67,12 +69,15 @@ class MainActivity : AppCompatActivity() {
             val device = result.device
             val address = device.address
 
-            // if (address !in WHITELIST_ADDRESSES) {
-            //     return  // Пропускаем устройство, если его нет в белом списке
-            // }
+            if (address !in WHITELIST_ADDRESSES) {
+                return  // Пропускаем устройство, если его нет в белом списке
+            }
 
             // Обновляем или добавляем устройство
             devicesMap[address] = result
+
+            // Отправляем данные по MQTT
+            mqttManager.sendBleDeviceData(address, result.rssi)
 
             // Тротилинг: обновляем UI не чаще чем раз в UPDATE_THROTTLE_MS
             val currentTime = System.currentTimeMillis()
@@ -99,6 +104,10 @@ class MainActivity : AppCompatActivity() {
 
         devicesContainer = findViewById(R.id.devicesContainer)
         scanButton = findViewById(R.id.scanButton)
+
+        // Инициализация MQTT Manager
+        mqttManager = MqttManager(this)
+        mqttManager.connect()
 
         // Инициализацию Bluetooth
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager;
@@ -322,5 +331,6 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         stopScan()
         handler.removeCallbacks(updateRunnable)
+        mqttManager.disconnect()
     }
 }
