@@ -6,14 +6,18 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
+import android.content.ContentValues.TAG
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -38,6 +42,7 @@ import java.util.Collections
 import java.util.UUID
 
 class MainActivity : AppCompatActivity() {
+
     // Взаимодействие с bluetooth
     private lateinit var bluetoothAdapter: BluetoothAdapter // Доступ к Bluetooth соединениям
     private lateinit var bluetoothLeScanner: BluetoothLeScanner // Сканер Ble меток
@@ -76,6 +81,7 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+
     // Объект обратного вызова для получения BLE меток: при нахождении результат добавляет в devicesMap
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
@@ -112,6 +118,7 @@ class MainActivity : AppCompatActivity() {
 
     // Запуск приложения
     override fun onCreate(savedInstanceState: Bundle?) {
+
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
@@ -154,6 +161,7 @@ class MainActivity : AppCompatActivity() {
                 requestPermissions()
             }
         }
+        requestIgnoreBatteryOptimizations()
     }
 
     private fun initializeMqtt() {
@@ -165,12 +173,19 @@ class MainActivity : AppCompatActivity() {
             options.isCleanSession = true
             options.connectionTimeout = 10
             options.keepAliveInterval = 60
+            options.isAutomaticReconnect = true
+            options.connectionTimeout = 10
 
-            // Используем правильный MqttCallback интерфейс
             mqttClient.setCallback(object : MqttCallback {
                 override fun connectionLost(cause: Throwable) {
                     runOnUiThread {
                         Toast.makeText(this@MainActivity, "MQTT соединение потеряно", Toast.LENGTH_SHORT).show()
+                    }
+                    // Автоматически переподключаемся
+                    try {
+                        mqttClient.reconnect()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
                     }
                 }
 
@@ -410,7 +425,32 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
+    // Добавьте в поля класса
+    private var isBackgroundServiceRunning = false
 
+    // Добавьте этот метод
+    private fun startBackgroundService() {
+        if (!isBackgroundServiceRunning) {
+            val intent = Intent(this, BleScannerService::class.java)
+            intent.action = "START_SCAN"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            isBackgroundServiceRunning = true
+        }
+    }
+
+    private fun stopBackgroundService() {
+        if (isBackgroundServiceRunning) {
+            val intent = Intent(this, BleScannerService::class.java)
+            intent.action = "STOP_SCAN"
+            stopService(intent)
+            isBackgroundServiceRunning = false
+        }
+    }
     private fun startScan() {
         if (!isScanning) {
             devicesMap.clear()
@@ -419,7 +459,9 @@ class MainActivity : AppCompatActivity() {
             isScanning = true
             scanButton.text = "Остановить сканирование"
 
-            // Еще одна проверка на нужные разрешения
+            // Запускаем фоновый сервис
+            startBackgroundService()
+
             val hasPermissions = checkPermission()
 
             if (!hasPermissions) {
@@ -434,11 +476,6 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 Toast.makeText(this, "Ошибка сканирования: ${e.message}", Toast.LENGTH_SHORT).show()
             }
-
-            // Останавливаем сканирование через scanPeriod
-            // handler.postDelayed({
-            //     stopScan()
-            // }, scanPeriod)
         }
     }
 
@@ -447,7 +484,9 @@ class MainActivity : AppCompatActivity() {
             isScanning = false
             scanButton.text = "Начать сканирование"
 
-            // Еще одна проверка на нужные разрешения
+            // Останавливаем фоновый сервис
+            stopBackgroundService()
+
             val hasPermissions = checkPermission()
 
             if (!hasPermissions) {
@@ -543,6 +582,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         stopScan()
+        stopBackgroundService()
         handler.removeCallbacks(updateRunnable)
         // Отключаем MQTT клиент
         if (::mqttClient.isInitialized && mqttClient.isConnected) {
@@ -550,6 +590,29 @@ class MainActivity : AppCompatActivity() {
                 mqttClient.disconnect()
             } catch (e: Exception) {
                 e.printStackTrace()
+            }
+        }
+    }
+    private fun ensureMqttConnection() {
+        if (!::mqttClient.isInitialized || !mqttClient.isConnected) {
+            try {
+                initializeMqtt()
+            } catch (e: Exception) {
+                // Запланировать повторную попытку
+                Handler(Looper.getMainLooper()).postDelayed({
+                    ensureMqttConnection()
+                }, 5000)
+            }
+        }
+    }
+    private fun requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+            intent.data = Uri.parse("package:$packageName")
+            try {
+                startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "Cannot request ignore battery optimizations: ${e.message}")
             }
         }
     }
